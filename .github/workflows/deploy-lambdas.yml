@@ -1,0 +1,106 @@
+name: deploy-test-lambdas
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      ROLE_NAME: supplier-user-test-lambda-role
+      RUNTIME: python3.10
+      HANDLER: lambda_function.lambda_handler
+
+    steps:
+      # ----------------------------
+      # Checkout
+      # ----------------------------
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # ----------------------------
+      # Configure AWS credentials
+      # ----------------------------
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+
+      # ----------------------------
+      # Create IAM role if not exists
+      # ----------------------------
+      - name: Create IAM role for Lambda (if not exists)
+        run: |
+          if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+            echo "IAM role already exists"
+          else
+            echo "Creating IAM role: $ROLE_NAME"
+
+            aws iam create-role \
+              --role-name "$ROLE_NAME" \
+              --assume-role-policy-document '{
+                "Version": "2012-10-17",
+                "Statement": [{
+                  "Effect": "Allow",
+                  "Principal": { "Service": "lambda.amazonaws.com" },
+                  "Action": "sts:AssumeRole"
+                }]
+              }'
+
+            aws iam attach-role-policy \
+              --role-name "$ROLE_NAME" \
+              --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+          fi
+
+      # ----------------------------
+      # Fetch Role ARN
+      # ----------------------------
+      - name: Get IAM Role ARN
+        id: role
+        run: |
+          ROLE_ARN=$(aws iam get-role \
+            --role-name "$ROLE_NAME" \
+            --query 'Role.Arn' \
+            --output text)
+          echo "ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV
+
+      # =========================================================
+      # CREATE supplierTestActions (NEW)
+      # =========================================================
+      - name: Build supplierTestActions
+        run: |
+          cd supplierTestActions
+          zip -r ../supplierTestActions.zip .
+
+      - name: Create supplierTestActions Lambda (if not exists)
+        run: |
+          if aws lambda get-function --function-name supplierTestActions >/dev/null 2>&1; then
+            echo "supplierTestActions already exists, skipping creation"
+          else
+            echo "Creating supplierTestActions Lambda"
+            aws lambda create-function \
+              --function-name supplierTestActions \
+              --runtime "$RUNTIME" \
+              --role "$ROLE_ARN" \
+              --handler "$HANDLER" \
+              --zip-file fileb://supplierTestActions.zip
+          fi
+
+      # # =========================================================
+      # # UPDATE userTestActions (EXISTING)
+      # # =========================================================
+      # - name: Build userTestActions
+      #   run: |
+      #     cd userTestActions
+      #     zip -r ../userTestActions.zip .
+
+      # - name: Update userTestActions Lambda
+      #   run: |
+      #     echo "Updating userTestActions Lambda"
+      #     aws lambda update-function-code \
+      #       --function-name userTestActions \
+      #       --zip-file fileb://userTestActions.zip
