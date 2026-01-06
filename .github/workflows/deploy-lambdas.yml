@@ -10,8 +10,13 @@ jobs:
 
     env:
       ROLE_NAME: supplier-user-test-lambda-role
+      FUNCTION_NAME: supplierTestActions
       RUNTIME: python3.10
       HANDLER: lambda_function.lambda_handler
+
+      # 🔐 VPC CONFIG (use PRIVATE subnets)
+      SUBNET_IDS: ${{ secrets.LAMBDA_SUBNET_IDS }}
+      SECURITY_GROUP_IDS: ${{ secrets.LAMBDA_SECURITY_GROUP_IDS }}
 
     steps:
       # ----------------------------
@@ -31,9 +36,9 @@ jobs:
           aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
 
       # ----------------------------
-      # Create IAM role if not exists
+      # Create IAM role (if not exists)
       # ----------------------------
-      - name: Create IAM role for Lambda (if not exists)
+      - name: Create IAM role for Lambda
         run: |
           if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
             echo "IAM role already exists"
@@ -54,13 +59,19 @@ jobs:
             aws iam attach-role-policy \
               --role-name "$ROLE_NAME" \
               --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+            aws iam attach-role-policy \
+              --role-name "$ROLE_NAME" \
+              --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
           fi
+
+          echo "Waiting for IAM propagation..."
+          sleep 20
 
       # ----------------------------
       # Fetch Role ARN
       # ----------------------------
       - name: Get IAM Role ARN
-        id: role
         run: |
           ROLE_ARN=$(aws iam get-role \
             --role-name "$ROLE_NAME" \
@@ -68,39 +79,40 @@ jobs:
             --output text)
           echo "ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV
 
-      # =========================================================
-      # CREATE supplierTestActions (NEW)
-      # =========================================================
+      # ----------------------------
+      # Build Lambda package
+      # ----------------------------
       - name: Build supplierTestActions
         run: |
           cd supplierTestActions
           zip -r ../supplierTestActions.zip .
 
-      - name: Create supplierTestActions Lambda (if not exists)
+      # ----------------------------
+      # Create or Update Lambda
+      # ----------------------------
+      - name: Deploy Lambda
         run: |
-          if aws lambda get-function --function-name supplierTestActions >/dev/null 2>&1; then
-            echo "supplierTestActions already exists, skipping creation"
+          if aws lambda get-function --function-name "$FUNCTION_NAME" >/dev/null 2>&1; then
+            echo "Lambda exists → updating code"
+            aws lambda update-function-code \
+              --function-name "$FUNCTION_NAME" \
+              --zip-file fileb://supplierTestActions.zip
           else
-            echo "Creating supplierTestActions Lambda"
+            echo "Creating Lambda with VPC config"
             aws lambda create-function \
-              --function-name supplierTestActions \
+              --function-name "$FUNCTION_NAME" \
               --runtime "$RUNTIME" \
               --role "$ROLE_ARN" \
               --handler "$HANDLER" \
-              --zip-file fileb://supplierTestActions.zip
+              --zip-file fileb://supplierTestActions.zip \
+              --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
           fi
 
-      # # =========================================================
-      # # UPDATE userTestActions (EXISTING)
-      # # =========================================================
-      # - name: Build userTestActions
-      #   run: |
-      #     cd userTestActions
-      #     zip -r ../userTestActions.zip .
-
-      # - name: Update userTestActions Lambda
-      #   run: |
-      #     echo "Updating userTestActions Lambda"
-      #     aws lambda update-function-code \
-      #       --function-name userTestActions \
-      #       --zip-file fileb://userTestActions.zip
+      # ----------------------------
+      # Ensure VPC config is applied
+      # ----------------------------
+      - name: Update Lambda VPC configuration
+        run: |
+          aws lambda update-function-configuration \
+            --function-name "$FUNCTION_NAME" \
+            --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
