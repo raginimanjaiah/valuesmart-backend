@@ -55,6 +55,9 @@ jobs:
               --role-name "$ROLE_NAME" \
               --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
           fi
+          
+          echo "Waiting for IAM role propagation..."
+          sleep 20
 
       # ----------------------------
       # Fetch Role ARN
