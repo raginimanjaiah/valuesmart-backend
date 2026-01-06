@@ -10,13 +10,12 @@ jobs:
 
     env:
       ROLE_NAME: supplier-user-test-lambda-role
-      FUNCTION_NAME: supplierTestActions
       RUNTIME: python3.10
       HANDLER: lambda_function.lambda_handler
 
-      # 🔐 VPC CONFIG (use PRIVATE subnets)
-      SUBNET_IDS: ${{ secrets.LAMBDA_SUBNET_IDS }}
-      SECURITY_GROUP_IDS: ${{ secrets.LAMBDA_SECURITY_GROUP_IDS }}
+      # 🔐 VPC CONFIG (PRIVATE SUBNETS)
+      SUBNET_IDS: subnet-aaa111,subnet-bbb222
+      SECURITY_GROUP_IDS: sg-ccc333
 
     steps:
       # ----------------------------
@@ -38,7 +37,7 @@ jobs:
       # ----------------------------
       # Create IAM role (if not exists)
       # ----------------------------
-      - name: Create IAM role for Lambda
+      - name: Create IAM role for Lambdas
         run: |
           if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
             echo "IAM role already exists"
@@ -69,7 +68,7 @@ jobs:
           sleep 20
 
       # ----------------------------
-      # Fetch Role ARN
+      # Get Role ARN
       # ----------------------------
       - name: Get IAM Role ARN
         run: |
@@ -79,28 +78,35 @@ jobs:
             --output text)
           echo "ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV
 
-      # ----------------------------
-      # Build Lambda package
-      # ----------------------------
+      # =========================================================
+      # Build Lambdas
+      # =========================================================
       - name: Build supplierTestActions
         run: |
           cd supplierTestActions
           zip -r ../supplierTestActions.zip .
+          cd ..
 
-      # ----------------------------
-      # Create or Update Lambda
-      # ----------------------------
-      - name: Deploy Lambda
+      - name: Build userTestActions
         run: |
-          if aws lambda get-function --function-name "$FUNCTION_NAME" >/dev/null 2>&1; then
-            echo "Lambda exists → updating code"
+          cd userTestActions
+          zip -r ../userTestActions.zip .
+          cd ..
+
+      # =========================================================
+      # Deploy supplierTestActions
+      # =========================================================
+      - name: Deploy supplierTestActions
+        run: |
+          if aws lambda get-function --function-name supplierTestActions >/dev/null 2>&1; then
+            echo "Updating supplierTestActions"
             aws lambda update-function-code \
-              --function-name "$FUNCTION_NAME" \
+              --function-name supplierTestActions \
               --zip-file fileb://supplierTestActions.zip
           else
-            echo "Creating Lambda with VPC config"
+            echo "Creating supplierTestActions"
             aws lambda create-function \
-              --function-name "$FUNCTION_NAME" \
+              --function-name supplierTestActions \
               --runtime "$RUNTIME" \
               --role "$ROLE_ARN" \
               --handler "$HANDLER" \
@@ -108,11 +114,31 @@ jobs:
               --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
           fi
 
-      # ----------------------------
-      # Ensure VPC config is applied
-      # ----------------------------
-      - name: Update Lambda VPC configuration
-        run: |
           aws lambda update-function-configuration \
-            --function-name "$FUNCTION_NAME" \
+            --function-name supplierTestActions \
+            --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
+
+      # =========================================================
+      # Deploy userTestActions
+      # =========================================================
+      - name: Deploy userTestActions
+        run: |
+          if aws lambda get-function --function-name userTestActions >/dev/null 2>&1; then
+            echo "Updating userTestActions"
+            aws lambda update-function-code \
+              --function-name userTestActions \
+              --zip-file fileb://userTestActions.zip
+          else
+            echo "Creating userTestActions"
+            aws lambda create-function \
+              --function-name userTestActions \
+              --runtime "$RUNTIME" \
+              --role "$ROLE_ARN" \
+              --handler "$HANDLER" \
+              --zip-file fileb://userTestActions.zip \
+              --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
+          fi
+
+          aws lambda update-function-configuration \
+            --function-name userTestActions \
             --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
