@@ -14,8 +14,9 @@ jobs:
       HANDLER: lambda_function.lambda_handler
 
       # 🔐 VPC CONFIG (PRIVATE SUBNETS)
-      SUBNET_IDS: subnet-aaa111,subnet-bbb222
-      SECURITY_GROUP_IDS: sg-ccc333
+      SUBNET_IDS: ${{ secrets.LAMBDA_SUBNET_IDS }}
+      SECURITY_GROUP_IDS: ${{ secrets.LAMBDA_SECURITY_GROUP_IDS }}
+
 
     steps:
       # ----------------------------
