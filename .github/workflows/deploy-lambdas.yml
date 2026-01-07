@@ -17,7 +17,6 @@ jobs:
       SUBNET_IDS: ${{ secrets.LAMBDA_SUBNET_IDS }}
       SECURITY_GROUP_IDS: ${{ secrets.LAMBDA_SECURITY_GROUP_IDS }}
 
-
     steps:
       # ----------------------------
       # Checkout
@@ -36,12 +35,14 @@ jobs:
           aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
 
       # ----------------------------
-      # Create IAM role (if not exists)
+      # Create / Fix IAM role for Lambdas
       # ----------------------------
-      - name: Create IAM role for Lambdas
+      - name: Ensure IAM role and policies
         run: |
+          set -e
+
           if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
-            echo "IAM role already exists"
+            echo "IAM role already exists: $ROLE_NAME"
           else
             echo "Creating IAM role: $ROLE_NAME"
 
@@ -55,18 +56,20 @@ jobs:
                   "Action": "sts:AssumeRole"
                 }]
               }'
-
-            aws iam attach-role-policy \
-              --role-name "$ROLE_NAME" \
-              --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-
-            aws iam attach-role-policy \
-              --role-name "$ROLE_NAME" \
-              --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
           fi
 
-          echo "Waiting for IAM propagation..."
-          sleep 20
+          echo "Attaching required policies..."
+
+          aws iam attach-role-policy \
+            --role-name "$ROLE_NAME" \
+            --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole || true
+
+          aws iam attach-role-policy \
+            --role-name "$ROLE_NAME" \
+            --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole || true
+
+          echo "Waiting for IAM role propagation..."
+          sleep 30
 
       # ----------------------------
       # Get Role ARN
@@ -99,8 +102,10 @@ jobs:
       # =========================================================
       - name: Deploy supplierTestActions
         run: |
+          set -e
+
           if aws lambda get-function --function-name supplierTestActions >/dev/null 2>&1; then
-            echo "Updating supplierTestActions"
+            echo "Updating supplierTestActions code"
             aws lambda update-function-code \
               --function-name supplierTestActions \
               --zip-file fileb://supplierTestActions.zip
@@ -113,8 +118,12 @@ jobs:
               --handler "$HANDLER" \
               --zip-file fileb://supplierTestActions.zip \
               --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
+
+            echo "Waiting after create..."
+            sleep 20
           fi
 
+          echo "Updating supplierTestActions VPC config"
           aws lambda update-function-configuration \
             --function-name supplierTestActions \
             --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
@@ -124,8 +133,10 @@ jobs:
       # =========================================================
       - name: Deploy userTestActions
         run: |
+          set -e
+
           if aws lambda get-function --function-name userTestActions >/dev/null 2>&1; then
-            echo "Updating userTestActions"
+            echo "Updating userTestActions code"
             aws lambda update-function-code \
               --function-name userTestActions \
               --zip-file fileb://userTestActions.zip
@@ -138,8 +149,12 @@ jobs:
               --handler "$HANDLER" \
               --zip-file fileb://userTestActions.zip \
               --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
+
+            echo "Waiting after create..."
+            sleep 20
           fi
 
+          echo "Updating userTestActions VPC config"
           aws lambda update-function-configuration \
             --function-name userTestActions \
             --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
