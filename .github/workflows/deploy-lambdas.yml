@@ -13,7 +13,7 @@ jobs:
       RUNTIME: python3.10
       HANDLER: lambda_function.lambda_handler
 
-      # 🔐 VPC CONFIG (PRIVATE SUBNETS)
+      # 🔐 VPC CONFIG (comma separated)
       SUBNET_IDS: ${{ secrets.LAMBDA_SUBNET_IDS }}
       SECURITY_GROUP_IDS: ${{ secrets.LAMBDA_SECURITY_GROUP_IDS }}
 
@@ -22,7 +22,7 @@ jobs:
       # Checkout
       # ----------------------------
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       # ----------------------------
       # Configure AWS credentials
@@ -35,14 +35,22 @@ jobs:
           aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
 
       # ----------------------------
-      # Create / Fix IAM role for Lambdas
+      # Setup Python
       # ----------------------------
-      - name: Ensure IAM role and policies
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # ----------------------------
+      # Create IAM role (if not exists)
+      # ----------------------------
+      - name: Create IAM role for Lambdas
         run: |
           set -e
 
           if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
-            echo "IAM role already exists: $ROLE_NAME"
+            echo "IAM role already exists"
           else
             echo "Creating IAM role: $ROLE_NAME"
 
@@ -56,22 +64,17 @@ jobs:
                   "Action": "sts:AssumeRole"
                 }]
               }'
+
+            aws iam attach-role-policy \
+              --role-name "$ROLE_NAME" \
+              --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+            aws iam attach-role-policy \
+              --role-name "$ROLE_NAME" \
+              --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
           fi
-          
-          echo "Waiting for IAM role propagation..."
-          sleep 20
 
-          echo "Attaching required policies..."
-
-          aws iam attach-role-policy \
-            --role-name "$ROLE_NAME" \
-            --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole || true
-
-          aws iam attach-role-policy \
-            --role-name "$ROLE_NAME" \
-            --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole || true
-
-          echo "Waiting for IAM role propagation..."
+          echo "Waiting for IAM propagation..."
           sleep 30
 
       # ----------------------------
@@ -86,19 +89,53 @@ jobs:
           echo "ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV
 
       # =========================================================
-      # Build Lambdas
+      # Build supplierTestActions (with requirements)
       # =========================================================
       - name: Build supplierTestActions
         run: |
+          set -e
           cd supplierTestActions
+
+          echo "Installing dependencies..."
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt -t .
+          fi
+
+          echo "Validating contents..."
+          ls -lah
+
+          echo "Creating zip..."
           zip -r ../supplierTestActions.zip .
+
           cd ..
 
+      # =========================================================
+      # Build userTestActions (with requirements)
+      # =========================================================
       - name: Build userTestActions
         run: |
+          set -e
           cd userTestActions
+
+          echo "Installing dependencies..."
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt -t .
+          fi
+
+          echo "Validating contents..."
+          ls -lah
+
+          echo "Creating zip..."
           zip -r ../userTestActions.zip .
+
           cd ..
+
+      # ----------------------------
+      # Debug zip sizes (safety)
+      # ----------------------------
+      - name: Verify zip files
+        run: |
+          ls -lh *.zip
 
       # =========================================================
       # Deploy supplierTestActions
@@ -121,12 +158,9 @@ jobs:
               --handler "$HANDLER" \
               --zip-file fileb://supplierTestActions.zip \
               --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
-
-            echo "Waiting after create..."
-            sleep 20
           fi
 
-          echo "Updating supplierTestActions VPC config"
+          echo "Updating VPC config"
           aws lambda update-function-configuration \
             --function-name supplierTestActions \
             --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
@@ -152,12 +186,9 @@ jobs:
               --handler "$HANDLER" \
               --zip-file fileb://userTestActions.zip \
               --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
-
-            echo "Waiting after create..."
-            sleep 20
           fi
 
-          echo "Updating userTestActions VPC config"
+          echo "Updating VPC config"
           aws lambda update-function-configuration \
             --function-name userTestActions \
             --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
