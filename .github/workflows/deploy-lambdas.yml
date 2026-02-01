@@ -14,6 +14,8 @@ jobs:
       SUBNET_IDS: ${{ secrets.LAMBDA_SUBNET_IDS }}
       SECURITY_GROUP_IDS: ${{ secrets.LAMBDA_SECURITY_GROUP_IDS }}
       S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+      API_ID: ${{ secrets.API_ID }}
+      ACCOUNT_ID: ${{ secrets.ACCOUNT_ID }}
 
     steps:
       - name: Checkout code
@@ -152,7 +154,7 @@ jobs:
               --statement-id AllowAPIGatewayInvokeUnique \
               --action lambda:InvokeFunction \
               --principal apigateway.amazonaws.com \
-              --source-arn "arn:aws:execute-api:${{ secrets.AWS_DEFAULT_REGION }}:$(aws sts get-caller-identity --query Account --output text):*/*/*/*" || true
-
+              --source-arn "arn:aws:execute-api:ap-southeast-2:${{ secrets.ACCOUNT_ID }}:${{ secrets.API_ID }}/*/*/*" || true
+              
             sleep 30  
           done
