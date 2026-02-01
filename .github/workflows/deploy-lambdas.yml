@@ -149,7 +149,7 @@ jobs:
             # We use '|| true' so the script doesn't fail if the permission already exists
             aws lambda add-permission \
               --function-name $FUNC \
-              --statement-id AllowAPIGatewayInvoke \
+              --statement-id AllowAPIGatewayInvokeUnique \
               --action lambda:InvokeFunction \
               --principal apigateway.amazonaws.com \
               --source-arn "arn:aws:execute-api:${{ secrets.AWS_DEFAULT_REGION }}:$(aws sts get-caller-identity --query Account --output text):*/*/*/*" || true
