@@ -1,4 +1,4 @@
-name: deploy-test-lambdas
+name: deploy-valuesmart-lambdas-dev
 
 on:
   push:
@@ -7,26 +7,20 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     env:
-      ROLE_NAME: supplier-user-test-lambda-role
+      ROLE_NAME: valuesmart-lambda-role-dev
       RUNTIME: python3.10
       HANDLER: lambda_function.lambda_handler
-
-      # 🔐 VPC CONFIG (comma separated)
+      # Ensure these secrets are comma-separated (e.g., subnet-1,subnet-2)
       SUBNET_IDS: ${{ secrets.LAMBDA_SUBNET_IDS }}
       SECURITY_GROUP_IDS: ${{ secrets.LAMBDA_SECURITY_GROUP_IDS }}
+      # Replace with your actual bucket name or a GitHub Secret
+      S3_BUCKET_NAME:  ${{ secrets.S3_BUCKET_NAME }}
 
     steps:
-      # ----------------------------
-      # Checkout
-      # ----------------------------
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ----------------------------
-      # Configure AWS credentials
-      # ----------------------------
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -34,26 +28,21 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
 
-      # ----------------------------
-      # Setup Python
-      # ----------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-
+          
       # ----------------------------
-      # Create IAM role (if not exists)
+      # Create IAM role with Inline S3 Policy
       # ----------------------------
       - name: Create IAM role for Lambdas
         run: |
           set -e
-
           if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
             echo "IAM role already exists"
           else
             echo "Creating IAM role: $ROLE_NAME"
-
             aws iam create-role \
               --role-name "$ROLE_NAME" \
               --assume-role-policy-document '{
@@ -65,130 +54,115 @@ jobs:
                 }]
               }'
 
-            aws iam attach-role-policy \
+            # Attach Standard Execution Policies
+            aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+            aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+            
+            # Add Inline S3 Get Privilege
+            aws iam put-role-policy \
               --role-name "$ROLE_NAME" \
-              --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+              --policy-name LambdaS3GetPolicy \
+              --policy-document '{
+                "Version": "2012-10-17",
+                "Statement": [
+                  {
+                    "Effect": "Allow",
+                    "Action": [
+                      "s3:GetObject"
+                    
+                    ],
+                    "Resource": [
+                      "arn:aws:s3:::'"$S3_BUCKET_NAME"'",
+                      "arn:aws:s3:::'"$S3_BUCKET_NAME"'/*"
+                    ]
+                  }
+                ]
+              }'
 
-            aws iam attach-role-policy \
-              --role-name "$ROLE_NAME" \
-              --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+            echo "Waiting for IAM propagation..."
+            sleep 30
           fi
 
-          echo "Waiting for IAM propagation..."
-          sleep 30
-
-      # ----------------------------
-      # Get Role ARN
-      # ----------------------------
       - name: Get IAM Role ARN
         run: |
-          ROLE_ARN=$(aws iam get-role \
-            --role-name "$ROLE_NAME" \
-            --query 'Role.Arn' \
-            --output text)
-          echo "ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV
+          ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text)
+          echo "ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV    
 
-      # =========================================================
-      # Build supplierTestActions (with requirements)
-      # =========================================================
+      # --- 1. BUILD & PUBLISH SHARED LAYER (Fixes Linux Binary issue) ---
+      - name: Build Lambda Layer
+        run: |
+          mkdir -p layer/python
+          pip install sqlalchemy pydantic pydantic-core pymysql cryptography -t layer/python
+          cd layer && zip -r ../shared_layer.zip . && cd ..
+
+      - name: Publish Layer Version
+        id: publish_layer
+        run: |
+          LAYER_ARN=$(aws lambda publish-layer-version \
+            --layer-name "SharedDependencies" \
+            --zip-file fileb://shared_layer.zip \
+            --compatible-runtimes python3.10 \
+            --query 'LayerVersionArn' --output text)
+          echo "LAYER_ARN=$LAYER_ARN" >> $GITHUB_ENV
+
+      # --- 2. BUILD FUNCTIONS (Zipping only source code) ---
       - name: Build supplierTestActions
         run: |
-          set -e
-          cd supplierTestActions
+          cd supplierTestActions && zip -r ../supplierTestActions.zip . && cd ..
 
-          echo "Installing dependencies..."
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt -t .
-          fi
-
-          echo "Validating contents..."
-          ls -lah
-
-          echo "Creating zip..."
-          zip -r ../supplierTestActions.zip .
-
-          cd ..
-
-      # =========================================================
-      # Build userTestActions (with requirements)
-      # =========================================================
       - name: Build userTestActions
         run: |
-          set -e
-          cd userTestActions
-
-          echo "Installing dependencies..."
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt -t .
-          fi
-
-          echo "Validating contents..."
-          ls -lah
-
-          echo "Creating zip..."
-          zip -r ../userTestActions.zip .
-
-          cd ..
-
-      # ----------------------------
-      # Debug zip sizes (safety)
-      # ----------------------------
-      - name: Verify zip files
+          cd userTestActions && zip -r ../userTestActions.zip . && cd ..
+          
+      - name: Build buyerActions
         run: |
-          ls -lh *.zip
+          cd buyerActions && zip -r ../buyerActions.zip . && cd ..
 
-      # =========================================================
-      # Deploy supplierTestActions
-      # =========================================================
+      # --- 3. DEPLOY FUNCTIONS ---
       - name: Deploy supplierTestActions
         run: |
-          set -e
-
           if aws lambda get-function --function-name supplierTestActions >/dev/null 2>&1; then
-            echo "Updating supplierTestActions code"
-            aws lambda update-function-code \
-              --function-name supplierTestActions \
-              --zip-file fileb://supplierTestActions.zip
+            aws lambda update-function-code --function-name supplierTestActions --zip-file fileb://supplierTestActions.zip
+            aws lambda update-function-configuration --function-name supplierTestActions --layers ${{ env.LAYER_ARN }}
           else
-            echo "Creating supplierTestActions"
             aws lambda create-function \
               --function-name supplierTestActions \
               --runtime "$RUNTIME" \
               --role "$ROLE_ARN" \
               --handler "$HANDLER" \
               --zip-file fileb://supplierTestActions.zip \
+              --layers ${{ env.LAYER_ARN }} \
               --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
           fi
 
-          echo "Updating VPC config"
-          aws lambda update-function-configuration \
-            --function-name supplierTestActions \
-            --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
-
-      # =========================================================
-      # Deploy userTestActions
-      # =========================================================
       - name: Deploy userTestActions
         run: |
-          set -e
-
           if aws lambda get-function --function-name userTestActions >/dev/null 2>&1; then
-            echo "Updating userTestActions code"
-            aws lambda update-function-code \
-              --function-name userTestActions \
-              --zip-file fileb://userTestActions.zip
+            aws lambda update-function-code --function-name userTestActions --zip-file fileb://userTestActions.zip
+            aws lambda update-function-configuration --function-name userTestActions --layers ${{ env.LAYER_ARN }}
           else
-            echo "Creating userTestActions"
             aws lambda create-function \
               --function-name userTestActions \
               --runtime "$RUNTIME" \
               --role "$ROLE_ARN" \
               --handler "$HANDLER" \
               --zip-file fileb://userTestActions.zip \
+              --layers ${{ env.LAYER_ARN }} \
+              --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
+          fi          
+          
+      - name: Deploy buyerActions
+        run: |
+          if aws lambda get-function --function-name buyerActions >/dev/null 2>&1; then
+            aws lambda update-function-code --function-name buyerActions --zip-file fileb://buyerActions.zip
+            aws lambda update-function-configuration --function-name buyerActions --layers ${{ env.LAYER_ARN }}
+          else
+            aws lambda create-function \
+              --function-name buyerActions \
+              --runtime "$RUNTIME" \
+              --role "$ROLE_ARN" \
+              --handler "$HANDLER" \
+              --zip-file fileb://buyerActions.zip \
+              --layers ${{ env.LAYER_ARN }} \
               --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
           fi
-
-          echo "Updating VPC config"
-          aws lambda update-function-configuration \
-            --function-name userTestActions \
-            --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
