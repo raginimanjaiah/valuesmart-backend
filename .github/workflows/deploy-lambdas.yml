@@ -11,11 +11,9 @@ jobs:
       ROLE_NAME: valuesmart-lambda-role-dev
       RUNTIME: python3.12
       HANDLER: lambda_function.lambda_handler
-      # Ensure these secrets are comma-separated (e.g., subnet-1,subnet-2)
       SUBNET_IDS: ${{ secrets.LAMBDA_SUBNET_IDS }}
       SECURITY_GROUP_IDS: ${{ secrets.LAMBDA_SECURITY_GROUP_IDS }}
-      # Replace with your actual bucket name or a GitHub Secret
-      S3_BUCKET_NAME:  ${{ secrets.S3_BUCKET_NAME }}
+      S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
 
     steps:
       - name: Checkout code
@@ -34,7 +32,7 @@ jobs:
           python-version: "3.12"
           
       # ----------------------------
-      # Create IAM role with Inline S3 Policy
+      # Create IAM role with Inline Policies
       # ----------------------------
       - name: Create IAM role for Lambdas
         run: |
@@ -54,11 +52,10 @@ jobs:
                 }]
               }'
 
-            # Attach Standard Execution Policies
             aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
             aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
             
-            # Add Inline S3 Get Privilege
+            # Policy 1: S3 Get Object Only
             aws iam put-role-policy \
               --role-name "$ROLE_NAME" \
               --policy-name LambdaS3GetPolicy \
@@ -67,18 +64,30 @@ jobs:
                 "Statement": [
                   {
                     "Effect": "Allow",
-                    "Action": [
-                      "s3:GetObject"
-                    
-                    ],
-                    "Resource": [
-                      "arn:aws:s3:::'"$S3_BUCKET_NAME"'",
-                      "arn:aws:s3:::'"$S3_BUCKET_NAME"'/*"
-                    ]
+                    "Action": "s3:GetObject",
+                    "Resource": "arn:aws:s3:::'"$S3_BUCKET_NAME"'/*"
                   }
                 ]
               }'
 
+            # Policy 2: Logging
+            aws iam put-role-policy \
+              --role-name "$ROLE_NAME" \
+              --policy-name LambdaLoggingPolicy \
+              --policy-document '{
+                "Version": "2012-10-17",
+                "Statement": [
+                  {
+                    "Effect": "Allow",
+                    "Action": [
+                      "logs:CreateLogGroup",
+                      "logs:CreateLogStream",
+                      "logs:PutLogEvents"
+                    ],
+                    "Resource": "arn:aws:logs:*:*:*"
+                  }
+                ]
+              }'
             echo "Waiting for IAM propagation..."
             sleep 30
           fi
@@ -88,7 +97,7 @@ jobs:
           ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text)
           echo "ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV    
 
-      # --- 1. BUILD & PUBLISH SHARED LAYER (Fixes Linux Binary issue) ---
+      # --- 1. BUILD & PUBLISH SHARED LAYER ---
       - name: Build Lambda Layer
         run: |
           mkdir -p layer/python
@@ -101,68 +110,34 @@ jobs:
           LAYER_ARN=$(aws lambda publish-layer-version \
             --layer-name "SharedDependencies" \
             --zip-file fileb://shared_layer.zip \
-            --compatible-runtimes python3.10 \
+            --compatible-runtimes python3.12 \
             --query 'LayerVersionArn' --output text)
           echo "LAYER_ARN=$LAYER_ARN" >> $GITHUB_ENV
 
-      # --- 2. BUILD FUNCTIONS (Zipping only source code) ---
-      - name: Build supplierTestActions
+      # --- 2. BUILD FUNCTIONS ---
+      - name: Build Functions
         run: |
           cd supplierTestActions && zip -r ../supplierTestActions.zip . && cd ..
-
-      - name: Build userTestActions
-        run: |
           cd userTestActions && zip -r ../userTestActions.zip . && cd ..
-          
-      - name: Build buyerActions
-        run: |
           cd buyerActions && zip -r ../buyerActions.zip . && cd ..
 
       # --- 3. DEPLOY FUNCTIONS ---
-      - name: Deploy supplierTestActions
+      - name: Deploy Functions
         run: |
-          if aws lambda get-function --function-name supplierTestActions >/dev/null 2>&1; then
-            aws lambda update-function-code --function-name supplierTestActions --zip-file fileb://supplierTestActions.zip
-            aws lambda update-function-configuration --function-name supplierTestActions --layers ${{ env.LAYER_ARN }}
-          else
-            aws lambda create-function \
-              --function-name supplierTestActions \
-              --runtime "$RUNTIME" \
-              --role "$ROLE_ARN" \
-              --handler "$HANDLER" \
-              --zip-file fileb://supplierTestActions.zip \
-              --layers ${{ env.LAYER_ARN }} \
-              --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
-          fi
-
-      - name: Deploy userTestActions
-        run: |
-          if aws lambda get-function --function-name userTestActions >/dev/null 2>&1; then
-            aws lambda update-function-code --function-name userTestActions --zip-file fileb://userTestActions.zip
-            aws lambda update-function-configuration --function-name userTestActions --layers ${{ env.LAYER_ARN }}
-          else
-            aws lambda create-function \
-              --function-name userTestActions \
-              --runtime "$RUNTIME" \
-              --role "$ROLE_ARN" \
-              --handler "$HANDLER" \
-              --zip-file fileb://userTestActions.zip \
-              --layers ${{ env.LAYER_ARN }} \
-              --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
-          fi          
-          
-      - name: Deploy buyerActions
-        run: |
-          if aws lambda get-function --function-name buyerActions >/dev/null 2>&1; then
-            aws lambda update-function-code --function-name buyerActions --zip-file fileb://buyerActions.zip
-            aws lambda update-function-configuration --function-name buyerActions --layers ${{ env.LAYER_ARN }}
-          else
-            aws lambda create-function \
-              --function-name buyerActions \
-              --runtime "$RUNTIME" \
-              --role "$ROLE_ARN" \
-              --handler "$HANDLER" \
-              --zip-file fileb://buyerActions.zip \
-              --layers ${{ env.LAYER_ARN }} \
-              --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
-          fi
+          set -e
+          FUNCTIONS=("supplierTestActions" "userTestActions" "buyerActions")
+          for FUNC in "${FUNCTIONS[@]}"; do
+            if aws lambda get-function --function-name $FUNC >/dev/null 2>&1; then
+              aws lambda update-function-code --function-name $FUNC --zip-file fileb://$FUNC.zip
+              aws lambda update-function-configuration --function-name $FUNC --layers ${{ env.LAYER_ARN }} --runtime python3.12
+            else
+              aws lambda create-function \
+                --function-name $FUNC \
+                --runtime python3.12 \
+                --role "$ROLE_ARN" \
+                --handler "$HANDLER" \
+                --zip-file fileb://$FUNC.zip \
+                --layers ${{ env.LAYER_ARN }} \
+                --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
+            fi
+          done
