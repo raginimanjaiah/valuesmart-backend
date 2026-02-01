@@ -122,7 +122,7 @@ jobs:
       - name: Build and Deploy Functions
         run: |
           set -e
-          FUNCTIONS=("supplierTestActions" "userTestActions" "buyerActions")
+          FUNCTIONS=( "buyerActions" "supplierTestActions" "userTestActions" )
           
           for FUNC in "${FUNCTIONS[@]}"; do
             # Build Zip
