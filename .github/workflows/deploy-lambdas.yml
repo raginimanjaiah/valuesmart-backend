@@ -153,4 +153,6 @@ jobs:
               --action lambda:InvokeFunction \
               --principal apigateway.amazonaws.com \
               --source-arn "arn:aws:execute-api:${{ secrets.AWS_DEFAULT_REGION }}:$(aws sts get-caller-identity --query Account --output text):*/*/*/*" || true
+
+            sleep 30  
           done
