@@ -32,7 +32,7 @@ jobs:
           python-version: "3.12"
           
       # ----------------------------
-      # Create IAM role with Inline Policies
+      # 1. Create IAM role with Inline Policies
       # ----------------------------
       - name: Create IAM role for Lambdas
         run: |
@@ -55,7 +55,7 @@ jobs:
             aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
             aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
             
-            # Policy 1: S3 Get Object Only
+            # Policy for S3 Get Object Only
             aws iam put-role-policy \
               --role-name "$ROLE_NAME" \
               --policy-name LambdaS3GetPolicy \
@@ -70,7 +70,7 @@ jobs:
                 ]
               }'
 
-            # Policy 2: Logging
+            # Policy for Logging
             aws iam put-role-policy \
               --role-name "$ROLE_NAME" \
               --policy-name LambdaLoggingPolicy \
@@ -97,7 +97,9 @@ jobs:
           ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text)
           echo "ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV    
 
-      # --- 1. BUILD & PUBLISH SHARED LAYER ---
+      # ----------------------------
+      # 2. BUILD & PUBLISH SHARED LAYER
+      # ----------------------------
       - name: Build Lambda Layer
         run: |
           mkdir -p layer/python
@@ -114,23 +116,25 @@ jobs:
             --query 'LayerVersionArn' --output text)
           echo "LAYER_ARN=$LAYER_ARN" >> $GITHUB_ENV
 
-      # --- 2. BUILD FUNCTIONS ---
-      - name: Build Functions
-        run: |
-          cd supplierTestActions && zip -r ../supplierTestActions.zip . && cd ..
-          cd userTestActions && zip -r ../userTestActions.zip . && cd ..
-          cd buyerActions && zip -r ../buyerActions.zip . && cd ..
-
-      # --- 3. DEPLOY FUNCTIONS ---
-      - name: Deploy Functions
+      # ----------------------------
+      # 3. BUILD & DEPLOY FUNCTIONS
+      # ----------------------------
+      - name: Build and Deploy Functions
         run: |
           set -e
           FUNCTIONS=("supplierTestActions" "userTestActions" "buyerActions")
+          
           for FUNC in "${FUNCTIONS[@]}"; do
+            # Build Zip
+            cd $FUNC && zip -r ../$FUNC.zip . && cd ..
+
+            # Create or Update Function
             if aws lambda get-function --function-name $FUNC >/dev/null 2>&1; then
+              echo "Updating $FUNC..."
               aws lambda update-function-code --function-name $FUNC --zip-file fileb://$FUNC.zip
               aws lambda update-function-configuration --function-name $FUNC --layers ${{ env.LAYER_ARN }} --runtime python3.12
             else
+              echo "Creating $FUNC..."
               aws lambda create-function \
                 --function-name $FUNC \
                 --runtime python3.12 \
@@ -140,4 +144,13 @@ jobs:
                 --layers ${{ env.LAYER_ARN }} \
                 --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
             fi
+
+            # ADD PERMISSION: Allow API Gateway to invoke this function
+            # We use '|| true' so the script doesn't fail if the permission already exists
+            aws lambda add-permission \
+              --function-name $FUNC \
+              --statement-id AllowAPIGatewayInvoke \
+              --action lambda:InvokeFunction \
+              --principal apigateway.amazonaws.com \
+              --source-arn "arn:aws:execute-api:${{ secrets.AWS_DEFAULT_REGION }}:$(aws sts get-caller-identity --query Account --output text):*/*/*/*" || true
           done
