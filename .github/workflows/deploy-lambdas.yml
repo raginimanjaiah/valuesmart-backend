@@ -16,6 +16,7 @@ jobs:
       S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
       API_ID: ${{ secrets.API_ID }}
       ACCOUNT_ID: ${{ secrets.ACCOUNT_ID }}
+      REGION: ap-southeast-2  # Set this to your specific region
 
     steps:
       - name: Checkout code
@@ -32,9 +33,9 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          
+
       # ----------------------------
-      # 1. Create IAM role with Inline Policies
+      # 1. IAM ROLE MANAGEMENT (Preserved)
       # ----------------------------
       - name: Create IAM role for Lambdas
         run: |
@@ -53,43 +54,12 @@ jobs:
                   "Action": "sts:AssumeRole"
                 }]
               }'
-
             aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
             aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
             
-            # Policy for S3 Get Object Only
-            aws iam put-role-policy \
-              --role-name "$ROLE_NAME" \
-              --policy-name LambdaS3GetPolicy \
-              --policy-document '{
-                "Version": "2012-10-17",
-                "Statement": [
-                  {
-                    "Effect": "Allow",
-                    "Action": "s3:GetObject",
-                    "Resource": "arn:aws:s3:::'"$S3_BUCKET_NAME"'/*"
-                  }
-                ]
-              }'
-
-            # Policy for Logging
-            aws iam put-role-policy \
-              --role-name "$ROLE_NAME" \
-              --policy-name LambdaLoggingPolicy \
-              --policy-document '{
-                "Version": "2012-10-17",
-                "Statement": [
-                  {
-                    "Effect": "Allow",
-                    "Action": [
-                      "logs:CreateLogGroup",
-                      "logs:CreateLogStream",
-                      "logs:PutLogEvents"
-                    ],
-                    "Resource": "arn:aws:logs:*:*:*"
-                  }
-                ]
-              }'
+            aws iam put-role-policy --role-name "$ROLE_NAME" --policy-name LambdaS3GetPolicy --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::$S3_BUCKET_NAME/*\"}]}"
+            
+            aws iam put-role-policy --role-name "$ROLE_NAME" --policy-name LambdaLoggingPolicy --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"logs:CreateLogGroup\",\"logs:CreateLogStream\",\"logs:PutLogEvents\"],\"Resource\":\"arn:aws:logs:*:*:*\"}]}"
             echo "Waiting for IAM propagation..."
             sleep 30
           fi
@@ -97,10 +67,10 @@ jobs:
       - name: Get IAM Role ARN
         run: |
           ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text)
-          echo "ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV    
+          echo "ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV
 
       # ----------------------------
-      # 2. BUILD & PUBLISH SHARED LAYER
+      # 2. SHARED LAYER (Preserved)
       # ----------------------------
       - name: Build Lambda Layer
         run: |
@@ -119,7 +89,7 @@ jobs:
           echo "LAYER_ARN=$LAYER_ARN" >> $GITHUB_ENV
 
       # ----------------------------
-      # 3. BUILD & DEPLOY FUNCTIONS
+      # 3. DEPLOY LAMBDA & SETUP API (New Logic Included)
       # ----------------------------
       - name: Build and Deploy Functions
         run: |
@@ -127,37 +97,59 @@ jobs:
           FUNCTIONS=( "buyerActions" )
           
           for FUNC in "${FUNCTIONS[@]}"; do
-            # Build Zip
+            # 1. Deploy Lambda Code
             cd $FUNC && zip -r ../$FUNC.zip . && cd ..
-
-            # Create or Update Function
             if aws lambda get-function --function-name $FUNC >/dev/null 2>&1; then
-              echo "Updating $FUNC..."
               aws lambda update-function-code --function-name $FUNC --zip-file fileb://$FUNC.zip
-              aws lambda update-function-configuration --function-name $FUNC --layers ${{ env.LAYER_ARN }} --runtime python3.12
+              aws lambda update-function-configuration --function-name $FUNC --layers ${{ env.LAYER_ARN }}
             else
-              echo "Creating $FUNC..."
-              aws lambda create-function \
-                --function-name $FUNC \
-                --runtime python3.12 \
-                --role "$ROLE_ARN" \
-                --handler "$HANDLER" \
-                --zip-file fileb://$FUNC.zip \
-                --layers ${{ env.LAYER_ARN }} \
+              aws lambda create-function --function-name $FUNC --runtime $RUNTIME --role $ROLE_ARN \
+                --handler $HANDLER --zip-file fileb://$FUNC.zip --layers ${{ env.LAYER_ARN }} \
                 --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
             fi
-            aws lambda remove-permission \
-                --function-name $FUNC \
-                --statement-id AllowAPIGatewayInvokeUnique || true
-                
-            # ADD PERMISSION: Allow API Gateway to invoke this function
-            # We use '|| true' so the script doesn't fail if the permission already exists
-            aws lambda add-permission \
-              --function-name $FUNC \
-              --statement-id AllowAPIGatewayInvokeUnique \
-              --action lambda:InvokeFunction \
-              --principal apigateway.amazonaws.com \
-              --source-arn "arn:aws:execute-api:ap-southeast-2:${{ secrets.ACCOUNT_ID }}:${{ secrets.API_ID }}/*/*/*" || true
-              
-            sleep 30  
+
+            # 2. Reset/Create API Gateway Resource
+            echo "Resetting /div_mktseg resource..."
+            EXISTING_RES_ID=$(aws apigateway get-resources --rest-api-id $API_ID --query "items[?pathPart=='div_mktseg'].id" --output text)
+            if [ "$EXISTING_RES_ID" != "None" ] && [ ! -z "$EXISTING_RES_ID" ]; then
+              aws apigateway delete-resource --rest-api-id $API_ID --resource-id $EXISTING_RES_ID
+            fi
+            
+            PARENT_ID=$(aws apigateway get-resources --rest-api-id $API_ID --query "items[?path=='/'].id" --output text)
+            RES_ID=$(aws apigateway create-resource --rest-api-id $API_ID --parent-id $PARENT_ID --path-part "div_mktseg" --query "id" --output text)
+
+            # 3. Configure GET Method (Lambda Proxy)
+            aws apigateway put-method --rest-api-id $API_ID --resource-id $RES_ID --http-method GET --authorization-type "NONE"
+            aws apigateway put-integration --rest-api-id $API_ID --resource-id $RES_ID --http-method GET --type AWS_PROXY \
+              --integration-http-method POST \
+              --uri "arn:aws:apigateway:$REGION:lambda:path/2015-03-31/functions/arn:aws:lambda:$REGION:$ACCOUNT_ID:function:$FUNC/invocations"
+
+            # 4. Configure CORS (OPTIONS Method)
+            aws apigateway put-method --rest-api-id $API_ID --resource-id $RES_ID --http-method OPTIONS --authorization-type "NONE"
+            aws apigateway put-integration --rest-api-id $API_ID --resource-id $RES_ID --http-method OPTIONS --type MOCK
+            
+            aws apigateway put-method-response --rest-api-id $API_ID --resource-id $RES_ID --http-method OPTIONS --status-code 200 \
+              --response-models '{"application/json": "Empty"}' \
+              --response-parameters '{"method.response.header.Access-Control-Allow-Headers": true, "method.response.header.Access-Control-Allow-Methods": true, "method.response.header.Access-Control-Allow-Origin": true}'
+
+            aws apigateway put-integration-response --rest-api-id $API_ID --resource-id $RES_ID --http-method OPTIONS --status-code 200 \
+              --response-templates '{"application/json": ""}' \
+              --response-parameters '{
+                "method.response.header.Access-Control-Allow-Headers": "'\''Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'\''",
+                "method.response.header.Access-Control-Allow-Methods": "'\''GET,OPTIONS'\''",
+                "method.response.header.Access-Control-Allow-Origin": "'\''*'\''"
+              }'
+
+            # 5. Refresh Lambda Permissions
+            aws lambda remove-permission --function-name $FUNC --statement-id AllowAPIGatewayInvokeUnique || true
+            aws lambda add-permission --function-name $FUNC --statement-id AllowAPIGatewayInvokeUnique \
+              --action lambda:InvokeFunction --principal apigateway.amazonaws.com \
+              --source-arn "arn:aws:execute-api:$REGION:$ACCOUNT_ID:$API_ID/*/*/*"
           done
+
+      # ----------------------------
+      # 4. FINAL DEPLOYMENT (Live)
+      # ----------------------------
+      - name: Deploy API to Dev Stage
+        run: |
+          aws apigateway create-deployment --rest-api-id $API_ID --stage-name "dev"
