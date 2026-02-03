@@ -16,7 +16,7 @@ jobs:
       S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
       API_ID: ${{ secrets.API_ID }}
       ACCOUNT_ID: ${{ secrets.ACCOUNT_ID }}
-      REGION: ap-southeast-2  # Set this to your specific region
+      REGION: ap-southeast-2
 
     steps:
       - name: Checkout code
@@ -27,7 +27,7 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          aws-region: ${{ env.REGION }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -89,42 +89,59 @@ jobs:
           echo "LAYER_ARN=$LAYER_ARN" >> $GITHUB_ENV
 
       # ----------------------------
-      # 3. DEPLOY LAMBDA & SETUP API (New Logic Included)
+      # 3. DEPLOY LAMBDA & SETUP API (Enhanced for Multi-Method/Multi-Resource)
       # ----------------------------
       - name: Build and Deploy Functions
         run: |
           set -e
-          FUNCTIONS=( "buyerActions" )
           
-          for FUNC in "${FUNCTIONS[@]}"; do
-            # 1. Deploy Lambda Code
-            cd $FUNC && zip -r ../$FUNC.zip . && cd ..
-            if aws lambda get-function --function-name $FUNC >/dev/null 2>&1; then
-              aws lambda update-function-code --function-name $FUNC --zip-file fileb://$FUNC.zip
-              aws lambda update-function-configuration --function-name $FUNC --layers ${{ env.LAYER_ARN }}
-            else
-              aws lambda create-function --function-name $FUNC --runtime $RUNTIME --role $ROLE_ARN \
-                --handler $HANDLER --zip-file fileb://$FUNC.zip --layers ${{ env.LAYER_ARN }} \
-                --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
+          # MAPPING: "LambdaFolderName:ResourcePath:HTTPMethod"
+          # Example: Multiple methods/paths can point to the same Lambda
+          DEPLOY_MAP=(
+            "buyerActions:div_mktseg:GET"
+            "playAd:play_ad:GET"
+            
+          )
+          
+          for ENTRY in "${DEPLOY_MAP[@]}"; do
+            IFS=':' read -r FUNC RES_PATH METHOD <<< "$ENTRY"
+            echo "----------------------------------------------------"
+            echo "Deploying Logic: $FUNC -> /$RES_PATH [$METHOD]"
+            echo "----------------------------------------------------"
+
+            # A. Deploy Lambda Code (Only zip/update once per Lambda folder)
+            if [ ! -f "$FUNC.zip" ]; then
+              cd $FUNC && zip -r ../$FUNC.zip . && cd ..
+              if aws lambda get-function --function-name $FUNC >/dev/null 2>&1; then
+                aws lambda update-function-code --function-name $FUNC --zip-file fileb://$FUNC.zip
+                aws lambda update-function-configuration --function-name $FUNC --layers ${{ env.LAYER_ARN }}
+              else
+                aws lambda create-function --function-name $FUNC --runtime $RUNTIME --role $ROLE_ARN \
+                  --handler $HANDLER --zip-file fileb://$FUNC.zip --layers ${{ env.LAYER_ARN }} \
+                  --vpc-config SubnetIds=$SUBNET_IDS,SecurityGroupIds=$SECURITY_GROUP_IDS
+              fi
             fi
 
-            # 2. Reset/Create API Gateway Resource
-            echo "Resetting /div_mktseg resource..."
-            EXISTING_RES_ID=$(aws apigateway get-resources --rest-api-id $API_ID --query "items[?pathPart=='div_mktseg'].id" --output text)
+            # B. Reset/Create API Gateway Resource
+            echo "Managing API Resource: /$RES_PATH"
+            EXISTING_RES_ID=$(aws apigateway get-resources --rest-api-id $API_ID --query "items[?pathPart=='$RES_PATH'].id" --output text)
+            
             if [ "$EXISTING_RES_ID" != "None" ] && [ ! -z "$EXISTING_RES_ID" ]; then
+              # Only delete if you want a clean slate; otherwise, skip to reuse ID
               aws apigateway delete-resource --rest-api-id $API_ID --resource-id $EXISTING_RES_ID
+              sleep 2
             fi
             
             PARENT_ID=$(aws apigateway get-resources --rest-api-id $API_ID --query "items[?path=='/'].id" --output text)
-            RES_ID=$(aws apigateway create-resource --rest-api-id $API_ID --parent-id $PARENT_ID --path-part "div_mktseg" --query "id" --output text)
+            RES_ID=$(aws apigateway create-resource --rest-api-id $API_ID --parent-id $PARENT_ID --path-part "$RES_PATH" --query "id" --output text)
 
-            # 3. Configure GET Method (Lambda Proxy)
-            aws apigateway put-method --rest-api-id $API_ID --resource-id $RES_ID --http-method GET --authorization-type "NONE"
-            aws apigateway put-integration --rest-api-id $API_ID --resource-id $RES_ID --http-method GET --type AWS_PROXY \
+            # C. Configure Method (GET/POST/etc.)
+            aws apigateway put-method --rest-api-id $API_ID --resource-id $RES_ID --http-method $METHOD --authorization-type "NONE"
+            aws apigateway put-integration --rest-api-id $API_ID --resource-id $RES_ID --http-method $METHOD --type AWS_PROXY \
               --integration-http-method POST \
               --uri "arn:aws:apigateway:$REGION:lambda:path/2015-03-31/functions/arn:aws:lambda:$REGION:$ACCOUNT_ID:function:$FUNC/invocations"
 
-            # 4. Configure CORS (OPTIONS Method)
+            # D. Configure CORS (OPTIONS Method)
             aws apigateway put-method --rest-api-id $API_ID --resource-id $RES_ID --http-method OPTIONS --authorization-type "NONE"
             aws apigateway put-integration --rest-api-id $API_ID --resource-id $RES_ID --http-method OPTIONS --type MOCK
             
@@ -136,15 +153,16 @@ jobs:
               --response-templates '{"application/json": ""}' \
               --response-parameters '{
                 "method.response.header.Access-Control-Allow-Headers": "'\''Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'\''",
-                "method.response.header.Access-Control-Allow-Methods": "'\''GET,OPTIONS'\''",
+                "method.response.header.Access-Control-Allow-Methods": "'\''GET,POST,OPTIONS'\''",
                 "method.response.header.Access-Control-Allow-Origin": "'\''*'\''"
               }'
 
-            # 5. Refresh Lambda Permissions
-            aws lambda remove-permission --function-name $FUNC --statement-id AllowAPIGatewayInvokeUnique || true
-            aws lambda add-permission --function-name $FUNC --statement-id AllowAPIGatewayInvokeUnique \
+            # E. Refresh Lambda Permissions (Unique per Function/Method/Path)
+            STATEMENT_ID="Allow-$FUNC-$RES_PATH-$METHOD"
+            aws lambda remove-permission --function-name $FUNC --statement-id "$STATEMENT_ID" || true
+            aws lambda add-permission --function-name $FUNC --statement-id "$STATEMENT_ID" \
               --action lambda:InvokeFunction --principal apigateway.amazonaws.com \
-              --source-arn "arn:aws:execute-api:$REGION:$ACCOUNT_ID:$API_ID/*/*/*"
+              --source-arn "arn:aws:execute-api:$REGION:$ACCOUNT_ID:$API_ID/*/$METHOD/$RES_PATH"
           done
 
       # ----------------------------

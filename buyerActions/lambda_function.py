@@ -193,10 +193,10 @@ def lambda_handler(event, context):
     action_key = f"{method}_{path}"
     
     actions = {
-        "get_get_div_mktseg": get_div_mktseg,
-        "get_get_div_mktseg_unitop": get_div_mktseg_unitop,
-        "get_get_div_mktseg_unitop_equip": get_div_mktseg_unitop_equip,
-        "get_get_div_mktseg_cache": get_div_mktseg_cache,
+        "get_div_mktseg": get_div_mktseg,
+        "get_div_mktseg_unitop": get_div_mktseg_unitop,
+        "get_div_mktseg_unitop_equip": get_div_mktseg_unitop_equip,
+        "get_div_mktseg_cache": get_div_mktseg_cache,
         "post_buyer_enquiry": post_buyer_enquiry
     }
 
