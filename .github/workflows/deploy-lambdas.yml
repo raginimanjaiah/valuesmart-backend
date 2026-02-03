@@ -1,4 +1,4 @@
-name: deploy-valuesmart-lambdas-dev
+name: deploy-valuesmart-lambdas-develop
 
 on:
   push:
