@@ -1,7 +1,9 @@
+
 import os
 import json
 import enum
-from sqlalchemy import Column, Integer, String,Enum,JSON,Date,update, bindparam,case,text
+from sqlalchemy import func
+from sqlalchemy import Column, Integer, String,Enum,JSON,Date,update, bindparam,case,text,BigInteger,DateTime,func
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy import create_engine
 from sqlalchemy.exc import SQLAlchemyError
@@ -13,7 +15,8 @@ from zoneinfo import ZoneInfo
 import sys
 import logging
 from pydantic import ValidationError,BaseModel,Field
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
+import logging
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +35,8 @@ class MachineDetails(Base):
     machine_image_url = Column(String(500))
     uploadstatus= Column(String(10))
     level_id = Column(Integer, nullable=False)
+    shown_on_banner = Column(String(1))
+    setup_cost= Column(Integer)
     archive = Column(
         Enum('Y', 'N', name='archive_enum'), 
         nullable=False, 
@@ -195,13 +200,34 @@ class TransactionType(enum.Enum):
     CREDIT = "CREDIT"
     DEBIT = "DEBIT"
 
-class SupplierTransaction(Base):
+class SupplierWalletTransaction(Base):
     __tablename__ = 'supplier_transactions'
     __table_args__ = {'schema': 'valuesmart'}
     id = Column(Integer, primary_key=True, autoincrement=True)
     supplier_id = Column(Integer, nullable=False)
-    credit_debit = Column(Enum(TransactionType), nullable=False)
-    amount = Column(Integer, nullable=False)
+    invoice_id= Column(String(100), nullable=True)
+    invoice_ref= Column(String(100), nullable=True)
+    credit_debit = Column(String(10), nullable=False)  # CREDIT / DEBIT
+    amount = Column(BigInteger, nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+
+class AdvertiserWallet(Base):
+    __tablename__ = "advertiser_wallet"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    advertiser_id = Column(Integer, nullable=False)
+    balance = Column(BigInteger, nullable=False, server_default=text("0"))
+
+class AdvertiserWalletTransaction(Base):
+    __tablename__ = "advertiser_transactions"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    advertiser_id = Column(BigInteger, nullable=False)
+    invoice_id= Column(String(100), nullable=True)
+    invoice_ref= Column(String(100), nullable=True)
+    credit_debit = Column(String(10), nullable=False)  # CREDIT / DEBIT
+    amount = Column(BigInteger, nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
 
 
 
@@ -274,7 +300,9 @@ def lambda_handler(event, context):
     "post_cancel_policy": post_cancel_policy,
     "patch_calendar_time_rates": patch_calendar_time_rates,
     "get_calendar_time_rates": get_calendar_time_rates,
-    "post_supplier_wallet": post_supplier_wallet
+    "post_supplier_wallet": post_supplier_wallet,
+    "post_ad_wallet": post_ad_wallet,
+    "patch_shown_on_banner": patch_shown_on_banner
     }
     print(f"the method is join {methodLower}_{methodPath}")
     handler = actions.get(f"{methodLower}_{methodPath}")
@@ -299,6 +327,29 @@ def lambda_handler(event, context):
     elif method == "PATCH":
         print(" the selected method is PATCH")
         return patchHandler(event, session)   
+
+
+
+def patch_shown_on_banner(event, session):
+    path_params = event.get('queryStringParameters', {}) or {}
+    equipment_id = path_params.get("equipment_id")
+    shown_on_banner = path_params.get("show")  
+    
+    if shown_on_banner not in ("Y", "N"):
+        return send_return_status(400, json.dumps({"message": "shown_on_banner must be 'Y' or 'N'"})
+
+    machine = session.query(MachineDetails).filter(
+            MachineDetails.id == equipment_id,
+            MachineDetails.archive == "N"
+            ).first()
+        
+    if not machine:
+        return send_return_status(500, json.dumps({"message": "no record found"}))
+        
+    machine.shown_on_banner = shown_on_banner
+    session.commit()
+    return send_return_status(200, json.dumps({"message": "Updated successfully", "id": equipment_id}))
+
 
 
 def patch_calendar_time_rates(event,session):
@@ -558,24 +609,7 @@ def getHandler(event,session):
                 },
                 "body": json.dumps(result)
                 }
-            # result = []
-            # for r in data:
-            #     result.append({
-            #      "id": r.id,
-            #      "equipment": r.machine_name,
-            #      "image_url": r.machine_image_url,
-            #      "uploadstatus":r.uploadstatus
-            #    })
-            # return {
-            #     "statusCode": 200,
-            #             "headers": {
-            # "Access-Control-Allow-Origin": "*",
-            # "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
-            # "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
-            #             },
-            #     "body": json.dumps(result)
 
-            # }
         elif path.startswith("/unit_operations"):
             data = session.query(UnitOperation).all()
             result = []
@@ -693,13 +727,15 @@ def postHandler(event,session):
             file_name = metaDetails.get("fileName")
             file_type = metaDetails.get("fileType")
             level_id = metaDetails.get("level_id")
+            shown_on_banner = metaDetails.get("shown_on_banner")
             upload_status=metaDetails.get("uploadstatus")
+            setup_cost=metaDetails.get("setupCost")
             dimName="equipments"
             dim_id=get_dimension_id(dimName,session)
             if dim_id is None:
                 return send_return_status(500, "internal server error")
             else:    
-                machine_image_url = f"https://{BUCKET_NAME}.s3.{REGION}.amazonaws.com/{file_name}"
+                machine_image_url = f"{file_name}"
                 s3=s3Creation()
                 record = MachineDetails(machine_name=machine_name, machine_image_url=machine_image_url,uploadstatus=upload_status,dim_id=dim_id,dim_name=dimName,level_id=level_id)
                 try:
@@ -1018,55 +1054,190 @@ def supplier_signup_json(data: dict) -> Supplier:
 
 
 def post_supplier_wallet(event, session):
+    """
+    Handles Credit/Debit for Advertiser Wallets with Concurrency Protection.
+    """
     try:
-        # 1. Parse and Validate
-        body = event.get("body")
-        if not body:
-            return send_return_status(400, json.dumps({"error": "Missing request body"}))
+        # 1. Extract and Parse Body
+        body_data = event.get("body")
+        if not body_data:
+            return send_return_status(400, json.dumps({"error": "Request body is missing"}))
         
-        raw_data = json.loads(body) if isinstance(body, str) else body
-        # Pydantic validates the existence of entityId and points here
-        data = WalletRequest(**raw_data)
+        meta = json.loads(body_data)
+        
+        # 2. Validation
+        required_fields = ["supplier_id", "points", "type", "invoice_id", "invoice_ref"]
+        for field in required_fields:
+            if field not in meta:
+                return send_return_status(400, json.dumps({"error": f"Missing field: {field}"}))
 
-        # 2. Database Transaction with Locking
-        # .with_for_update() is vital for credit/debit consistency
-        wallet = (
-            session.query(SupplierWallet)
-            .filter_by(supplier_id=data.supplier_id)
-            .with_for_update()
-            .first()
-        )
-        if wallet:
-            wallet.balance += data.points
-        else:
-            # Creation path: only storing the ID and balance
-            wallet = SupplierWallet(
-                supplier_id=data.supplier_id,
-                balance=data.points
-            )
+        supplier_id = meta.get("supplier_id")
+        amount = abs(float(meta.get("points"))) # Ensure amount is positive for logic
+        tx_type = meta.get("type").upper()      # Expecting 'CREDIT' or 'DEBIT'
+        inv_id = meta.get("invoice_id")
+        inv_ref = meta.get("invoice_ref")
+
+        # 3. Idempotency Check (Prevent duplicate processing of same invoice)
+        # Assuming SupplierWalletTransaction has a UNIQUE constraint on invoice_id
+        existing_tx = session.query(SupplierWalletTransaction).filter_by(invoice_id=inv_id).first()
+        if existing_tx:
+            return send_return_status(409, json.dumps({
+                "error": "Duplicate Transaction",
+                "message": f"Invoice {inv_id} has already been processed."
+            }))
+
+        # 4. Atomic Database Operations with Row Locking
+        # .with_for_update() locks this specific advertiser's row until commit/rollback
+        wallet = session.query(SupplierWallet).filter_by(supplier_id=supplier_id).with_for_update().first()
+
+        if not wallet:
+            if tx_type == "DEBIT":
+                return send_return_status(404, json.dumps({"error": "Wallet not found. Cannot debit a new wallet."}))
+            
+            # Create wallet if it doesn't exist (only for Credit)
+            wallet = SupplierWallet(supplier_id=supplier_id, balance=0.0)
             session.add(wallet)
-        # 3. Create Audit Trail
-        tx = SupplierTransaction(
-            supplier_id=data.supplier_id,
-            credit_debit="CREDIT",
-            amount=data.points
+            session.flush() # Push to DB to ensure wallet exists for the transaction record
+
+        # 5. Business Logic: Credit vs Debit
+        if tx_type == "CREDIT":
+            wallet.balance += amount
+        elif tx_type == "DEBIT":
+            if wallet.balance < amount:
+                return send_return_status(400, json.dumps({"error": "Insufficient balance"}))
+            wallet.balance -= amount
+        else:
+            return send_return_status(400, json.dumps({"error": "Invalid type. Must be CREDIT or DEBIT."}))
+
+        # 6. Record the Transaction (Audit Trail)
+        new_transaction = SupplierWalletTransaction(
+            supplier_id=supplier_id,
+            invoice_id=inv_id,
+            invoice_ref=inv_ref,
+            credit_debit=tx_type,
+            amount=amount,
+           
         )
-        session.add(tx)
-        # 4. Atomic Commit
+        session.add(new_transaction)
+
+        # 7. Finalize Transaction
         session.commit()
+        
+        logger.info(f"Success: {tx_type} of {amount} for {supplier_id}. New Balance: {wallet.balance}")
+        
         return send_return_status(200, json.dumps({
-            "supplier_id": data.supplier_id,
-            "new_balance": wallet.balance
+            "message": "Transaction successful",
+            "new_balance": wallet.balance,
+            "invoice_id": inv_id
         }))
-    except ValidationError as e:
-        # Returns a clear 400 error if entityId or points are missing/invalid
-        return send_return_status(400, e.json())
+
+    except IntegrityError as e:
+        # Catches race conditions where two threads try to insert the same invoice_id at once
+        session.rollback()
+        logger.warning(f"Integrity Error (Possible Duplicate): {str(e)}")
+        return send_return_status(409, json.dumps({"error": "Transaction already in progress or completed"}))
+    
     except SQLAlchemyError as e:
         session.rollback()
-        logger.error(f"DB Error: {str(e)}")
-        return send_return_status(500, json.dumps({"error": "Database error"}))
+        logger.error(f"Database Error: {str(e)}")
+        return send_return_status(500, json.dumps({"error": "A database error occurred"}))
+    
     except Exception as e:
         session.rollback()
-        logger.error(f"Unexpected Error: {str(e)}")
+        logger.error(f"Unexpected System Error: {str(e)}")
         return send_return_status(500, json.dumps({"error": "Internal server error"}))
 
+
+def post_ad_wallet(event, session):
+    """
+    Handles Credit/Debit for Advertiser Wallets with Concurrency Protection.
+    """
+    try:
+        # 1. Extract and Parse Body
+        body_data = event.get("body")
+        if not body_data:
+            return send_return_status(400, json.dumps({"error": "Request body is missing"}))
+        
+        meta = json.loads(body_data)
+        
+        # 2. Validation
+        required_fields = ["advertiser_id", "points", "type", "invoice_id", "invoice_ref"]
+        for field in required_fields:
+            if field not in meta:
+                return send_return_status(400, json.dumps({"error": f"Missing field: {field}"}))
+
+        adv_id = meta.get("advertiser_id")
+        amount = abs(float(meta.get("points"))) # Ensure amount is positive for logic
+        tx_type = meta.get("type").upper()      # Expecting 'CREDIT' or 'DEBIT'
+        inv_id = meta.get("invoice_id")
+        inv_ref = meta.get("invoice_ref")
+
+        # 3. Idempotency Check (Prevent duplicate processing of same invoice)
+        # Assuming AdvertiserWalletTransaction has a UNIQUE constraint on invoice_id
+        existing_tx = session.query(AdvertiserWalletTransaction).filter_by(invoice_id=inv_id).first()
+        if existing_tx:
+            return send_return_status(409, json.dumps({
+                "error": "Duplicate Transaction",
+                "message": f"Invoice {inv_id} has already been processed."
+            }))
+
+        # 4. Atomic Database Operations with Row Locking
+        # .with_for_update() locks this specific advertiser's row until commit/rollback
+        wallet = session.query(AdvertiserWallet).filter_by(advertiser_id=adv_id).with_for_update().first()
+
+        if not wallet:
+            if tx_type == "DEBIT":
+                return send_return_status(404, json.dumps({"error": "Wallet not found. Cannot debit a new wallet."}))
+            
+            # Create wallet if it doesn't exist (only for Credit)
+            wallet = AdvertiserWallet(advertiser_id=adv_id, balance=0.0)
+            session.add(wallet)
+            session.flush() # Push to DB to ensure wallet exists for the transaction record
+
+        # 5. Business Logic: Credit vs Debit
+        if tx_type == "CREDIT":
+            wallet.balance += amount
+        elif tx_type == "DEBIT":
+            if wallet.balance < amount:
+                return send_return_status(400, json.dumps({"error": "Insufficient balance"}))
+            wallet.balance -= amount
+        else:
+            return send_return_status(400, json.dumps({"error": "Invalid type. Must be CREDIT or DEBIT."}))
+
+        # 6. Record the Transaction (Audit Trail)
+        new_transaction = AdvertiserWalletTransaction(
+            advertiser_id=adv_id,
+            invoice_id=inv_id,
+            invoice_ref=inv_ref,
+            credit_debit=tx_type,
+            amount=amount,
+           
+        )
+        session.add(new_transaction)
+
+        # 7. Finalize Transaction
+        session.commit()
+        
+        logger.info(f"Success: {tx_type} of {amount} for {adv_id}. New Balance: {wallet.balance}")
+        
+        return send_return_status(200, json.dumps({
+            "message": "Transaction successful",
+            "new_balance": wallet.balance,
+            "invoice_id": inv_id
+        }))
+
+    except IntegrityError as e:
+        # Catches race conditions where two threads try to insert the same invoice_id at once
+        session.rollback()
+        logger.warning(f"Integrity Error (Possible Duplicate): {str(e)}")
+        return send_return_status(409, json.dumps({"error": "Transaction already in progress or completed"}))
+    
+    except SQLAlchemyError as e:
+        session.rollback()
+        logger.error(f"Database Error: {str(e)}")
+        return send_return_status(500, json.dumps({"error": "A database error occurred"}))
+    
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Unexpected System Error: {str(e)}")
+        return send_return_status(500, json.dumps({"error": "Internal server error"}))
